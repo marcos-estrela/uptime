@@ -1,0 +1,74 @@
+---
+name: vigia
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      forcar_falha:
+        description: simular queda para testar o alerta
+        default: "nao"
+
+permissions:
+  issues: write
+
+jobs:
+  sondar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # Alvos em Secrets: alem de sumirem do YAML, o GitHub os MASCARA nos logs
+      # de execucao — que em repositorio publico sao publicos tambem.
+      ALVO_IP: ${{ secrets.ALVO_IP }}
+      ALVO_WEBHOOK: ${{ secrets.ALVO_WEBHOOK }}
+    steps:
+      - name: sondar e reagir
+        run: |
+          falhas=""
+          if [ "${{ inputs.forcar_falha }}" = "sim" ]; then
+            falhas="teste forcado via workflow_dispatch"
+          else
+            ok22=""
+            for i in 1 2 3; do
+              timeout 10 bash -c "</dev/tcp/$ALVO_IP/22" && { ok22=1; break; }
+              sleep 15
+            done
+            [ -z "$ok22" ] && falhas="porta 22 sem resposta em 3 tentativas"
+            if [ -n "$ALVO_WEBHOOK" ] && getent hosts "$ALVO_WEBHOOK" >/dev/null 2>&1; then
+              okh=""
+              for i in 1 2 3; do
+                code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' https://$ALVO_WEBHOOK/health || echo 000)
+                [ "$code" = "200" ] && { okh=1; break; }
+                sleep 15
+              done
+              [ -z "$okh" ] && falhas="${falhas:+$falhas; }webhook /health respondeu $code"
+            fi
+          fi
+
+          # Incoming Webhook: a URL ja carrega destino e identidade do app —
+          # sem token de bot, sem escopo, sem member ID.
+          dm() {
+            curl -s -X POST -H 'Content-type: application/json' \
+              -d "{\"text\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1")}" \
+              "$SLACK_WEBHOOK_URL" >/dev/null
+          }
+
+          aberta=$(gh issue list --repo "$GITHUB_REPOSITORY" --label queda --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$falhas" ]; then
+            if [ -z "$aberta" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --label queda \
+                --title "devbox fora do ar" \
+                --body "Detectado pelo vigia externo: $falhas"
+              dm ":rotating_light: [vigia devbox] *FORA DO AR* — $falhas (visto dos runners do GitHub)"
+            fi
+            echo "::error::$falhas"
+            exit 1
+          fi
+
+          if [ -n "$aberta" ]; then
+            gh issue close "$aberta" --repo "$GITHUB_REPOSITORY" --comment "Voltou a responder."
+            dm ":white_check_mark: [vigia devbox] voltou ao ar — rode \`make agent-reconcile\` no trama (webhooks podem ter se perdido na janela)"
+          fi
